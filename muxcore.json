@@ -1,0 +1,8 @@
+{
+  "id": "downloader-sabnzbd",
+  "name": "SABnzbd / Usenet Downloader",
+  "version": "0.1.0",
+  "description": "SABnzbd HTTP API bridge for NZB/usenet downloads",
+  "roles": ["downloader", "usenet"],
+  "capabilities": ["downloader", "downloader.usenet", "usenet", "settings"]
+}
