@@ -17,11 +17,11 @@ func (m *Module) Settings() []contracts.SettingDef {
 	return []contracts.SettingDef{
 		{
 			Key: "base_url", Label: "SABnzbd URL", Type: contracts.SettingTypeString,
-			Value: m.base, Description: "e.g. http://127.0.0.1:8080", Group: "Connection",
+			Value: m.base, Description: "e.g. http://127.0.0.1:8080 (operator opt-in; leave empty for soft-empty)", Group: "Connection",
 		},
 		{
 			Key: "api_key", Label: "API key", Type: contracts.SettingTypeSecret,
-			Value: key, Description: "SABnzbd API key", Group: "Connection",
+			Value: key, Description: "SABnzbd API key (operator opt-in; never required for CI)", Group: "Connection",
 		},
 	}
 }
@@ -39,6 +39,10 @@ func (m *Module) UpdateSetting(key, value string) error {
 	default:
 		return fmt.Errorf("unknown setting %q", key)
 	}
-	m.client = &sabnzbd.Client{BaseURL: m.base, APIKey: m.apiKey}
+	c := &sabnzbd.Client{BaseURL: m.base, APIKey: m.apiKey}
+	if m.client != nil && m.client.HTTPClient != nil {
+		c.HTTPClient = m.client.HTTPClient
+	}
+	m.client = c
 	return nil
 }
