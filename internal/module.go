@@ -169,7 +169,7 @@ func (m *Module) Stop(ctx context.Context) error {
 		_ = m.httpSrv.Shutdown(ctx)
 	}
 	if m.mc != nil {
-		m.mc.Close()
+		_ = m.mc.Close()
 	}
 	return nil
 }
@@ -267,9 +267,7 @@ func (m *Module) watchJob(id, name string) {
 					}
 				}
 			}
-			select {
-			case <-ticker.C:
-			}
+			<-ticker.C
 		}
 	}()
 }
