@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/Muxcore-Media/core/pkg/contracts"
+	"github.com/Muxcore-Media/core/sdk/go/client"
 	modulesdk "github.com/Muxcore-Media/core/sdk/go/module"
 	"github.com/Muxcore-Media/downloader-sabnzbd/internal/sabnzbd"
 	usenetv1 "github.com/Muxcore-Media/downloader-sabnzbd/proto/gen/muxcore/usenet/v1"
@@ -41,6 +42,8 @@ type Module struct {
 	publish   EventPublisher
 	pollEvery time.Duration
 	watched   sync.Map // jobID -> struct{}
+
+	mc *client.Client
 }
 
 type Config struct {
@@ -119,7 +122,7 @@ func (m *Module) Info() contracts.ModuleInfo {
 		Roles:        []string{"downloader", "usenet"},
 		Description:  "SABnzbd HTTP API bridge for NZB/usenet downloads",
 		Capabilities: []string{"downloader", "downloader.usenet", "usenet", "settings"},
-		HTTPAddr:     m.grpcAddr,
+		HTTPAddr:     m.httpAddr,
 	}
 }
 
@@ -154,6 +157,7 @@ func (m *Module) Start(ctx context.Context) error {
 			slog.Error("health serve", "error", err)
 		}
 	}()
+	go m.dialCore(context.Background())
 	return nil
 }
 
@@ -164,7 +168,32 @@ func (m *Module) Stop(ctx context.Context) error {
 	if m.httpSrv != nil {
 		_ = m.httpSrv.Shutdown(ctx)
 	}
+	if m.mc != nil {
+		m.mc.Close()
+	}
 	return nil
+}
+
+func (m *Module) dialCore(ctx context.Context) {
+	meshAddr := os.Getenv("MUXCORE_GRPC_ADDR")
+	if meshAddr == "" {
+		return
+	}
+	insecureMode := os.Getenv("MUXCORE_INSECURE_DISABLE_TLS") == "true" || os.Getenv("MUXCORE_GRPC_INSECURE") == "true"
+	var opts []client.Option
+	if insecureMode {
+		opts = append(opts, client.WithInsecure())
+	}
+	c, err := client.Dial(meshAddr, opts...)
+	if err != nil {
+		slog.Warn("sabnzbd: dial core failed", "error", err)
+		return
+	}
+	m.mc = c
+	m.SetPublisher(func(ctx context.Context, eventType string, payload []byte) error {
+		return c.Events.Publish(ctx, eventType, m.id, payload)
+	})
+	slog.Info("sabnzbd: connected to core mesh", "addr", meshAddr)
 }
 
 func (m *Module) Health(ctx context.Context) error {
@@ -217,7 +246,7 @@ func (m *Module) watchJob(id, name string) {
 		ticker := time.NewTicker(m.pollEvery)
 		defer ticker.Stop()
 		defer m.watched.Delete(id)
-		deadline := time.Now().Add(2 * time.Minute)
+		deadline := time.Now().Add(72 * time.Hour)
 		for time.Now().Before(deadline) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			hist, err := m.client.History(ctx, 50)
