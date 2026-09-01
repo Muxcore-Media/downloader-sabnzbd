@@ -21,6 +21,8 @@ message AddNZBRequest {
   string name = 2;
   string category = 3;
   bool paused = 4;
+  // nzb_content is raw NZB XML (SABnzbd mode=addfile). Preferred over nzb_url when set.
+  bytes nzb_content = 5;
 }
 
 message AddNZBResponse {
