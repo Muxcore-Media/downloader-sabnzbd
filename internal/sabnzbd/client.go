@@ -2,6 +2,7 @@
 package sabnzbd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"time"
 )
+
+const apiKeyHeader = "X-SABnzbd-Apikey"
 
 // Client talks to SABnzbd's /api endpoint.
 type Client struct {
@@ -27,7 +30,40 @@ func (c *Client) http() *http.Client {
 	return &http.Client{Timeout: 30 * time.Second}
 }
 
+func validateNZBURL(nzbURL string) error {
+	if strings.TrimSpace(nzbURL) == "" {
+		return fmt.Errorf("nzb_url required")
+	}
+	u, err := url.Parse(nzbURL)
+	if err != nil {
+		return fmt.Errorf("nzb_url must be http(s): %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("nzb_url must be http(s)")
+	}
+	if u.Host == "" {
+		return fmt.Errorf("nzb_url must be http(s)")
+	}
+	return nil
+}
+
+func parseJobID(out map[string]any, mode string) (string, error) {
+	ids, ok := out["nzo_ids"].([]any)
+	if !ok || len(ids) == 0 {
+		return "", fmt.Errorf("sabnzbd %s: empty nzo_ids in response", mode)
+	}
+	id := strings.TrimSpace(fmt.Sprint(ids[0]))
+	if id == "" {
+		return "", fmt.Errorf("sabnzbd %s: empty nzo_ids in response", mode)
+	}
+	return id, nil
+}
+
 func (c *Client) call(ctx context.Context, mode string, extra url.Values) (map[string]any, error) {
+	return c.callWithBody(ctx, http.MethodGet, mode, extra, nil, "")
+}
+
+func (c *Client) callWithBody(ctx context.Context, method, mode string, extra url.Values, body io.Reader, contentType string) (map[string]any, error) {
 	if c.BaseURL == "" {
 		return nil, fmt.Errorf("sabnzbd base URL required")
 	}
@@ -40,7 +76,6 @@ func (c *Client) call(ctx context.Context, mode string, extra url.Values) (map[s
 	}
 	q := u.Query()
 	q.Set("mode", mode)
-	q.Set("apikey", c.APIKey)
 	q.Set("output", "json")
 	for k, vs := range extra {
 		for _, v := range vs {
@@ -49,24 +84,28 @@ func (c *Client) call(ctx context.Context, mode string, extra url.Values) (map[s
 	}
 	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if err != nil {
 		return nil, err
+	}
+	req.Header.Set(apiKeyHeader, c.APIKey)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	resp, err := c.http().Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("sabnzbd %s: HTTP %d: %s", mode, resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("sabnzbd %s: HTTP %d: %s", mode, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	var out map[string]any
-	if err := json.Unmarshal(body, &out); err != nil {
+	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, fmt.Errorf("sabnzbd %s decode: %w", mode, err)
 	}
 	if st, _ := out["status"].(bool); !st && out["error"] != nil {
@@ -77,6 +116,9 @@ func (c *Client) call(ctx context.Context, mode string, extra url.Values) (map[s
 
 // AddURL queues an NZB by URL.
 func (c *Client) AddURL(ctx context.Context, nzbURL, name, category string, paused bool) (jobID string, err error) {
+	if err := validateNZBURL(nzbURL); err != nil {
+		return "", err
+	}
 	extra := url.Values{}
 	extra.Set("name", nzbURL)
 	if name != "" {
@@ -92,10 +134,29 @@ func (c *Client) AddURL(ctx context.Context, nzbURL, name, category string, paus
 	if err != nil {
 		return "", err
 	}
-	if ids, ok := out["nzo_ids"].([]any); ok && len(ids) > 0 {
-		return fmt.Sprint(ids[0]), nil
+	return parseJobID(out, "addurl")
+}
+
+// AddFile queues NZB XML bytes (mode=addfile).
+func (c *Client) AddFile(ctx context.Context, content []byte, name, category string, paused bool) (string, error) {
+	if len(content) == 0 {
+		return "", fmt.Errorf("nzb_content required")
 	}
-	return "", nil
+	extra := url.Values{}
+	if name != "" {
+		extra.Set("nzbname", name)
+	}
+	if category != "" {
+		extra.Set("cat", category)
+	}
+	if paused {
+		extra.Set("priority", "-2")
+	}
+	out, err := c.callWithBody(ctx, http.MethodPost, "addfile", extra, bytes.NewReader(content), "application/x-nzb")
+	if err != nil {
+		return "", err
+	}
+	return parseJobID(out, "addfile")
 }
 
 // QueueItem is a simplified queue row.
@@ -191,6 +252,48 @@ func (c *Client) History(ctx context.Context, limit int) ([]HistoryItem, error) 
 	if err != nil {
 		return nil, err
 	}
+	return parseHistorySlots(out)
+}
+
+// HistoryJob returns one history row by NZO id (avoids missing jobs outside the last N slots).
+func (c *Client) HistoryJob(ctx context.Context, id string) (*HistoryItem, error) {
+	if id == "" {
+		return nil, nil
+	}
+	out, err := c.call(ctx, "history", url.Values{"name": {"show"}, "value": {id}})
+	if err != nil {
+		return nil, err
+	}
+	items, err := parseHistorySlots(out)
+	if err != nil {
+		return nil, err
+	}
+	for _, it := range items {
+		if it.ID == id {
+			cp := it
+			return &cp, nil
+		}
+	}
+	if len(items) == 1 {
+		cp := items[0]
+		return &cp, nil
+	}
+	return nil, nil
+}
+
+// HistoryFiles returns extracted file paths for a completed download.
+func (c *Client) HistoryFiles(ctx context.Context, id string) ([]HistoryFile, error) {
+	if id == "" {
+		return nil, nil
+	}
+	out, err := c.call(ctx, "history", url.Values{"name": {"files"}, "value": {id}})
+	if err != nil {
+		return nil, err
+	}
+	return parseHistoryFiles(out)
+}
+
+func parseHistorySlots(out map[string]any) ([]HistoryItem, error) {
 	h, _ := out["history"].(map[string]any)
 	if h == nil {
 		return nil, nil
@@ -211,4 +314,47 @@ func (c *Client) History(ctx context.Context, limit int) ([]HistoryItem, error) 
 		})
 	}
 	return items, nil
+}
+
+func parseHistoryFiles(resp map[string]any) ([]HistoryFile, error) {
+	h, _ := resp["history"].(map[string]any)
+	if h == nil {
+		return nil, nil
+	}
+	// files mode may return a flat "files" list or slot-embedded files.
+	if files, ok := h["files"].([]any); ok {
+		return mapFileEntries(files), nil
+	}
+	slots, _ := h["slots"].([]any)
+	var out []HistoryFile
+	for _, s := range slots {
+		m, _ := s.(map[string]any)
+		if m == nil {
+			continue
+		}
+		if files, ok := m["files"].([]any); ok {
+			out = append(out, mapFileEntries(files)...)
+		}
+	}
+	return out, nil
+}
+
+func mapFileEntries(files []any) []HistoryFile {
+	out := make([]HistoryFile, 0, len(files))
+	for _, f := range files {
+		m, _ := f.(map[string]any)
+		if m == nil {
+			continue
+		}
+		path := fmt.Sprint(m["filename"])
+		if path == "" {
+			path = fmt.Sprint(m["path"])
+		}
+		size, _ := strconv.ParseInt(fmt.Sprint(m["size"]), 10, 64)
+		if size == 0 {
+			size, _ = strconv.ParseInt(fmt.Sprint(m["bytes"]), 10, 64)
+		}
+		out = append(out, HistoryFile{Path: path, Size: size})
+	}
+	return out
 }

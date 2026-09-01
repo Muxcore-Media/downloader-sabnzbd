@@ -14,14 +14,22 @@ func (m *Module) Settings() []contracts.SettingDef {
 	if key != "" {
 		key = "********"
 	}
+	mode := "live"
+	if m.fixture {
+		mode = "fixture"
+	}
 	return []contracts.SettingDef{
 		{
 			Key: "base_url", Label: "SABnzbd URL", Type: contracts.SettingTypeString,
-			Value: m.base, Description: "e.g. http://127.0.0.1:8080 (operator opt-in; leave empty for soft-empty)", Group: "Connection",
+			Value: m.base, Description: "e.g. http://127.0.0.1:8080 (operator opt-in; ignored when fixture)", Group: "Connection",
 		},
 		{
 			Key: "api_key", Label: "API key", Type: contracts.SettingTypeSecret,
 			Value: key, Description: "SABnzbd API key (operator opt-in; never required for CI)", Group: "Connection",
+		},
+		{
+			Key: "engine", Label: "Engine", Type: contracts.SettingTypeString,
+			Value: mode, Description: "fixture when SABNZBD_FIXTURE=1 or DOWNLOADER_ENGINE=fixture", Group: "Connection",
 		},
 	}
 }
@@ -36,13 +44,17 @@ func (m *Module) UpdateSetting(key, value string) error {
 		if value != "" && value != "********" {
 			m.apiKey = value
 		}
+	case "engine":
+		return fmt.Errorf("engine is controlled by SABNZBD_FIXTURE / DOWNLOADER_ENGINE")
 	default:
 		return fmt.Errorf("unknown setting %q", key)
 	}
-	c := &sabnzbd.Client{BaseURL: m.base, APIKey: m.apiKey}
-	if m.client != nil && m.client.HTTPClient != nil {
-		c.HTTPClient = m.client.HTTPClient
+	if !m.fixture {
+		c := &sabnzbd.Client{BaseURL: m.base, APIKey: m.apiKey}
+		if cl, ok := m.api.(*sabnzbd.Client); ok && cl.HTTPClient != nil {
+			c.HTTPClient = cl.HTTPClient
+		}
+		m.api = c
 	}
-	m.client = c
 	return nil
 }

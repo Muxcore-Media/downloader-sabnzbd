@@ -3,8 +3,10 @@ package sabnzbd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"sync/atomic"
 )
@@ -30,6 +32,7 @@ type mockJob struct {
 	Pct      float64
 	SizeMB   float64
 	LeftMB   float64
+	Files    []HistoryFile
 }
 
 // NewMockServer starts an httptest SABnzbd API that accepts the given API key.
@@ -80,6 +83,9 @@ func (m *MockServer) Complete(id, storage string) bool {
 	} else if j.Storage == "" {
 		j.Storage = "/downloads/" + j.Name
 	}
+	if len(j.Files) == 0 {
+		j.Files = defaultFixtureFiles(j.Storage, j.Name)
+	}
 	m.history[id] = j
 	return true
 }
@@ -98,12 +104,20 @@ func (m *MockServer) Fail(id string) bool {
 	return true
 }
 
+func (m *MockServer) authOK(r *http.Request) bool {
+	key := r.Header.Get(apiKeyHeader)
+	if key == "" {
+		key = r.URL.Query().Get("apikey") // legacy SAB / proxy fallback
+	}
+	return key == m.APIKey
+}
+
 func (m *MockServer) handleAPI(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	if q.Get("apikey") != m.APIKey {
+	if !m.authOK(r) {
 		http.Error(w, `{"error":"API Key Incorrect"}`, http.StatusForbidden)
 		return
 	}
+	q := r.URL.Query()
 	mode := q.Get("mode")
 	switch mode {
 	case "addurl":
@@ -113,6 +127,29 @@ func (m *MockServer) handleAPI(w http.ResponseWriter, r *http.Request) {
 		if name == "" {
 			name = q.Get("name")
 		}
+		job := &mockJob{
+			ID: id, Name: name, Category: q.Get("cat"),
+			Status: "Downloading", Pct: 10, SizeMB: 100, LeftMB: 90,
+			Storage: "/downloads/" + name,
+		}
+		if q.Get("priority") == "-2" {
+			job.Status = "Paused"
+		}
+		m.queue[id] = job
+		m.mu.Unlock()
+		writeJSON(w, map[string]any{"status": true, "nzo_ids": []string{id}})
+	case "addfile":
+		name := q.Get("nzbname")
+		if name == "" {
+			name = "upload.nzb"
+		}
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+		if len(body) == 0 {
+			http.Error(w, `{"error":"empty nzb"}`, http.StatusBadRequest)
+			return
+		}
+		m.mu.Lock()
+		id := fmt.Sprintf("SABnzbd_nzo_%d", m.seq.Add(1))
 		job := &mockJob{
 			ID: id, Name: name, Category: q.Get("cat"),
 			Status: "Downloading", Pct: 10, SizeMB: 100, LeftMB: 90,
@@ -169,6 +206,31 @@ func (m *MockServer) handleAPI(w http.ResponseWriter, r *http.Request) {
 		m.mu.Unlock()
 		writeJSON(w, map[string]any{"status": true})
 	case "history":
+		switch q.Get("name") {
+		case "show", "files":
+			id := q.Get("value")
+			m.mu.Lock()
+			j, ok := m.history[id]
+			m.mu.Unlock()
+			if !ok {
+				writeJSON(w, map[string]any{"history": map[string]any{"slots": []any{}}})
+				return
+			}
+			slot := map[string]any{
+				"nzo_id": j.ID, "name": j.Name, "status": j.Status,
+				"category": j.Category, "storage": j.Storage,
+			}
+			if q.Get("name") == "files" {
+				files := make([]map[string]any, 0, len(j.Files))
+				for _, f := range j.Files {
+					files = append(files, map[string]any{"filename": f.Path, "size": strconv.FormatInt(f.Size, 10)})
+				}
+				writeJSON(w, map[string]any{"history": map[string]any{"files": files}})
+				return
+			}
+			writeJSON(w, map[string]any{"history": map[string]any{"slots": []any{slot}}})
+			return
+		}
 		m.mu.Lock()
 		slots := make([]map[string]any, 0, len(m.history))
 		for _, j := range m.history {

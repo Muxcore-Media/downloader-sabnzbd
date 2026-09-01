@@ -21,6 +21,8 @@ import (
 	usenetv1 "github.com/Muxcore-Media/downloader-sabnzbd/proto/gen/muxcore/usenet/v1"
 )
 
+const moduleVersion = "0.1.1"
+
 // EventPublisher emits download.* domain events (test sink or mesh adapter).
 type EventPublisher func(ctx context.Context, eventType string, payload []byte) error
 
@@ -29,11 +31,12 @@ type Module struct {
 	grpcAddr string
 	httpAddr string
 
-	cfgMu  sync.RWMutex
-	base   string
-	apiKey string
+	cfgMu   sync.RWMutex
+	base    string
+	apiKey  string
+	fixture bool
 
-	client  *sabnzbd.Client
+	api     sabnzbd.API
 	grpcSrv *grpc.Server
 	lis     net.Listener
 	httpSrv *http.Server
@@ -41,7 +44,7 @@ type Module struct {
 	pubMu     sync.RWMutex
 	publish   EventPublisher
 	pollEvery time.Duration
-	watched   sync.Map // jobID -> struct{}
+	watched   sync.Map // jobID -> jobName
 
 	mc *client.Client
 }
@@ -52,9 +55,24 @@ type Config struct {
 	APIKey     string
 	GRPCAddr   string
 	HTTPAddr   string
+	Fixture    bool
 	Publish    EventPublisher
 	PollEvery  time.Duration
 	HTTPClient *http.Client // optional; for tests inject httptest transport
+}
+
+func fixtureEnabled(explicit bool) bool {
+	if explicit {
+		return true
+	}
+	if os.Getenv("SABNZBD_FIXTURE") == "1" || strings.EqualFold(os.Getenv("SABNZBD_FIXTURE"), "true") {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DOWNLOADER_ENGINE"))) {
+	case "fixture", "fake":
+		return true
+	}
+	return false
 }
 
 func NewModule(cfg Config) *Module {
@@ -83,29 +101,39 @@ func NewModule(cfg Config) *Module {
 	if poll <= 0 {
 		poll = 2 * time.Second
 	}
+	useFixture := fixtureEnabled(cfg.Fixture)
 	m := &Module{
 		id:        cfg.ID,
 		grpcAddr:  cfg.GRPCAddr,
 		httpAddr:  cfg.HTTPAddr,
 		base:      cfg.BaseURL,
 		apiKey:    cfg.APIKey,
+		fixture:   useFixture,
 		publish:   cfg.Publish,
 		pollEvery: poll,
 	}
-	m.rebuildClient(cfg.HTTPClient)
+	if useFixture {
+		m.api = sabnzbd.NewFixtureClient()
+		slog.Info("using fixture SABnzbd backend (no live SAB)")
+	} else {
+		m.rebuildAPI(cfg.HTTPClient)
+	}
 	return m
 }
 
-func (m *Module) rebuildClient(httpClient *http.Client) {
+func (m *Module) rebuildAPI(httpClient *http.Client) {
 	m.cfgMu.RLock()
 	defer m.cfgMu.RUnlock()
+	if m.fixture {
+		return
+	}
 	c := &sabnzbd.Client{BaseURL: m.base, APIKey: m.apiKey}
 	if httpClient != nil {
 		c.HTTPClient = httpClient
-	} else if m.client != nil && m.client.HTTPClient != nil {
-		c.HTTPClient = m.client.HTTPClient
+	} else if cl, ok := m.api.(*sabnzbd.Client); ok && cl.HTTPClient != nil {
+		c.HTTPClient = cl.HTTPClient
 	}
-	m.client = c
+	m.api = c
 }
 
 func (m *Module) SetPublisher(p EventPublisher) {
@@ -118,7 +146,7 @@ func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
 		ID:           m.id,
 		Name:         "SABnzbd / Usenet Downloader",
-		Version:      "0.1.0",
+		Version:      moduleVersion,
 		Roles:        []string{"downloader", "usenet"},
 		Description:  "SABnzbd HTTP API bridge for NZB/usenet downloads",
 		Capabilities: []string{"downloader", "downloader.usenet", "usenet", "settings"},
@@ -127,6 +155,18 @@ func (m *Module) Info() contracts.ModuleInfo {
 }
 
 func (m *Module) Init(ctx context.Context) error { return nil }
+
+func (m *Module) serveHealth(w http.ResponseWriter, _ *http.Request) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.Health(ctx); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(err.Error()))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
 
 func (m *Module) Start(ctx context.Context) error {
 	lis, err := net.Listen("tcp", m.grpcAddr)
@@ -139,26 +179,42 @@ func (m *Module) Start(ctx context.Context) error {
 	modulesdk.RegisterSettings(m.grpcSrv, m.id, m)
 
 	go func() {
-		slog.Info("usenet gRPC listening", "addr", m.grpcAddr)
+		slog.Info("usenet gRPC listening", "addr", m.grpcAddr, "fixture", m.fixture)
 		if err := m.grpcSrv.Serve(lis); err != nil {
 			slog.Error("gRPC serve", "error", err)
 		}
 	}()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-	m.httpSrv = &http.Server{Addr: m.httpAddr, Handler: mux}
+	mux.HandleFunc("/health", m.serveHealth)
+	mux.HandleFunc("/healthz", m.serveHealth)
+	m.httpSrv = &http.Server{Handler: mux}
+	httpLis, err := net.Listen("tcp", m.httpAddr)
+	if err != nil {
+		return fmt.Errorf("listen health %s: %w", m.httpAddr, err)
+	}
+	m.httpAddr = httpLis.Addr().String()
 	go func() {
 		slog.Info("health listening", "addr", m.httpAddr)
-		if err := m.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := m.httpSrv.Serve(httpLis); err != nil && err != http.ErrServerClosed {
 			slog.Error("health serve", "error", err)
 		}
 	}()
 	go m.dialCore(context.Background())
 	return nil
+}
+
+// ListenAddr returns the bound gRPC address after Start (useful for tests with :0).
+func (m *Module) ListenAddr() string {
+	if m.lis == nil {
+		return m.grpcAddr
+	}
+	return m.lis.Addr().String()
+}
+
+// HTTPListenAddr returns the bound health HTTP address after Start.
+func (m *Module) HTTPListenAddr() string {
+	return m.httpAddr
 }
 
 func (m *Module) Stop(ctx context.Context) error {
@@ -197,23 +253,42 @@ func (m *Module) dialCore(ctx context.Context) {
 }
 
 func (m *Module) Health(ctx context.Context) error {
+	if m.fixture {
+		return nil
+	}
 	m.cfgMu.RLock()
 	base, key := m.base, m.apiKey
 	m.cfgMu.RUnlock()
 	if base == "" || key == "" {
 		return nil // unconfigured optional peer
 	}
-	_, err := m.client.Queue(ctx)
+	_, err := m.api.Queue(ctx)
 	return err
 }
 
 func (m *Module) configured() error {
+	if m.fixture {
+		return nil
+	}
 	m.cfgMu.RLock()
 	defer m.cfgMu.RUnlock()
 	if m.base == "" || m.apiKey == "" {
-		return fmt.Errorf("sabnzbd unconfigured: set SABNZBD_URL + SABNZBD_API_KEY (operator opt-in)")
+		return fmt.Errorf("sabnzbd unconfigured: set SABNZBD_URL + SABNZBD_API_KEY (or SABNZBD_FIXTURE=1 / DOWNLOADER_ENGINE=fixture)")
 	}
 	return nil
+}
+
+func (m *Module) queueJobName(ctx context.Context, id string) string {
+	items, err := m.api.Queue(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, it := range items {
+		if it.ID == id {
+			return it.Name
+		}
+	}
+	return ""
 }
 
 // OfflineDispatch queues an NZB against the configured (or mock) SABnzbd and
@@ -223,14 +298,14 @@ func (m *Module) OfflineDispatch(ctx context.Context, nzbURL, name, category str
 	if err := m.configured(); err != nil {
 		return "", err
 	}
-	id, err := m.client.AddURL(ctx, nzbURL, name, category, false)
+	id, err := m.api.AddURL(ctx, nzbURL, name, category, false)
 	if err != nil {
 		return "", err
 	}
 	if name == "" {
 		name = nzbURL
 	}
-	m.publishDownload(contracts.EventDownloadStarted, id, name, "", "")
+	m.publishDownload(contracts.EventDownloadStarted, id, name, "", "", nil)
 	m.watchJob(id, name)
 	return id, m.waitHistory(ctx, id)
 }
@@ -239,7 +314,7 @@ func (m *Module) watchJob(id, name string) {
 	if id == "" {
 		return
 	}
-	if _, loaded := m.watched.LoadOrStore(id, struct{}{}); loaded {
+	if _, loaded := m.watched.LoadOrStore(id, name); loaded {
 		return
 	}
 	go func() {
@@ -249,26 +324,31 @@ func (m *Module) watchJob(id, name string) {
 		deadline := time.Now().Add(72 * time.Hour)
 		for time.Now().Before(deadline) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			hist, err := m.client.History(ctx, 50)
+			h, err := m.api.HistoryJob(ctx, id)
 			cancel()
-			if err == nil {
-				for _, h := range hist {
-					if h.ID != id {
-						continue
-					}
-					st := strings.ToLower(h.Status)
-					switch {
-					case strings.Contains(st, "complete"):
-						m.publishDownload(contracts.EventDownloadCompleted, h.ID, h.Name, h.Storage, "")
-						return
-					case strings.Contains(st, "fail"):
-						m.publishDownload(contracts.EventDownloadFailed, h.ID, h.Name, h.Storage, h.Status)
-						return
-					}
+			if err == nil && h != nil {
+				st := strings.ToLower(h.Status)
+				switch {
+				case strings.Contains(st, "complete"):
+					files := m.historyFiles(context.Background(), id)
+					m.publishDownload(contracts.EventDownloadCompleted, h.ID, h.Name, h.Storage, "", files)
+					return
+				case strings.Contains(st, "fail"):
+					m.publishDownload(contracts.EventDownloadFailed, h.ID, h.Name, h.Storage, h.Status, nil)
+					return
 				}
 			}
-			<-ticker.C
+			select {
+			case <-ticker.C:
+			}
 		}
+		jobName := name
+		if jobName == "" {
+			if v, ok := m.watched.Load(id); ok {
+				jobName, _ = v.(string)
+			}
+		}
+		m.publishDownload(contracts.EventDownloadFailed, id, jobName, "", "watch deadline exceeded (72h)", nil)
 	}()
 }
 
@@ -276,14 +356,11 @@ func (m *Module) waitHistory(ctx context.Context, id string) error {
 	ticker := time.NewTicker(m.pollEvery)
 	defer ticker.Stop()
 	for {
-		hist, err := m.client.History(ctx, 50)
+		h, err := m.api.HistoryJob(ctx, id)
 		if err != nil {
 			return err
 		}
-		for _, h := range hist {
-			if h.ID != id {
-				continue
-			}
+		if h != nil {
 			st := strings.ToLower(h.Status)
 			if strings.Contains(st, "complete") {
 				return nil
@@ -300,16 +377,31 @@ func (m *Module) waitHistory(ctx context.Context, id string) error {
 	}
 }
 
-func (m *Module) publishDownload(eventType, id, name, savePath, errStr string) {
+func (m *Module) historyFiles(ctx context.Context, id string) []contracts.DownloadEventFile {
+	files, err := m.api.HistoryFiles(ctx, id)
+	if err != nil || len(files) == 0 {
+		return nil
+	}
+	out := make([]contracts.DownloadEventFile, 0, len(files))
+	for _, f := range files {
+		out = append(out, contracts.DownloadEventFile{Path: f.Path, Size: f.Size})
+	}
+	return out
+}
+
+func (m *Module) publishDownload(eventType, id, name, savePath, errStr string, files []contracts.DownloadEventFile) {
 	m.pubMu.RLock()
 	pub := m.publish
 	m.pubMu.RUnlock()
 	if pub == nil {
 		return
 	}
+	if len(files) == 0 && savePath != "" {
+		files = []contracts.DownloadEventFile{{Path: savePath}}
+	}
 	payload, err := json.Marshal(contracts.DownloadEventPayload{
 		ID: id, Name: name, SavePath: savePath, Label: "usenet", Error: errStr,
-		Files: filesFromStorage(savePath),
+		Files: files,
 	})
 	if err != nil {
 		return
@@ -321,31 +413,43 @@ func (m *Module) publishDownload(eventType, id, name, savePath, errStr string) {
 	}
 }
 
-func filesFromStorage(storage string) []contracts.DownloadEventFile {
-	if storage == "" {
-		return nil
-	}
-	return []contracts.DownloadEventFile{{Path: storage}}
-}
-
 type usenetServer struct {
 	usenetv1.UnimplementedUsenetDownloaderServiceServer
 	m *Module
+}
+
+func (s *usenetServer) addNZBJob(ctx context.Context, req *usenetv1.AddNZBRequest) (id, name string, err error) {
+	if len(req.GetNzbContent()) > 0 {
+		id, err = s.m.api.AddFile(ctx, req.GetNzbContent(), req.GetName(), req.GetCategory(), req.GetPaused())
+	} else {
+		id, err = s.m.api.AddURL(ctx, req.GetNzbUrl(), req.GetName(), req.GetCategory(), req.GetPaused())
+	}
+	if err != nil {
+		return "", "", err
+	}
+	name = req.GetName()
+	if name == "" {
+		if len(req.GetNzbContent()) > 0 {
+			name = "upload.nzb"
+		} else {
+			name = req.GetNzbUrl()
+		}
+	}
+	return id, name, nil
 }
 
 func (s *usenetServer) AddNZB(ctx context.Context, req *usenetv1.AddNZBRequest) (*usenetv1.AddNZBResponse, error) {
 	if err := s.m.configured(); err != nil {
 		return nil, err
 	}
-	id, err := s.m.client.AddURL(ctx, req.GetNzbUrl(), req.GetName(), req.GetCategory(), req.GetPaused())
+	if len(req.GetNzbContent()) == 0 && req.GetNzbUrl() == "" {
+		return nil, fmt.Errorf("nzb_url or nzb_content required")
+	}
+	id, name, err := s.addNZBJob(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	name := req.GetName()
-	if name == "" {
-		name = req.GetNzbUrl()
-	}
-	s.m.publishDownload(contracts.EventDownloadStarted, id, name, "", "")
+	s.m.publishDownload(contracts.EventDownloadStarted, id, name, "", "", nil)
 	if !req.GetPaused() {
 		s.m.watchJob(id, name)
 	}
@@ -356,7 +460,7 @@ func (s *usenetServer) ListQueue(ctx context.Context, req *usenetv1.ListQueueReq
 	if err := s.m.configured(); err != nil {
 		return &usenetv1.ListQueueResponse{}, nil
 	}
-	items, err := s.m.client.Queue(ctx)
+	items, err := s.m.api.Queue(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -382,7 +486,7 @@ func (s *usenetServer) Pause(ctx context.Context, req *usenetv1.PauseRequest) (*
 	if err := s.m.configured(); err != nil {
 		return nil, err
 	}
-	if err := s.m.client.Pause(ctx, req.GetId()); err != nil {
+	if err := s.m.api.Pause(ctx, req.GetId()); err != nil {
 		return nil, err
 	}
 	return &usenetv1.PauseResponse{Success: true}, nil
@@ -392,11 +496,13 @@ func (s *usenetServer) Resume(ctx context.Context, req *usenetv1.ResumeRequest) 
 	if err := s.m.configured(); err != nil {
 		return nil, err
 	}
-	if err := s.m.client.Resume(ctx, req.GetId()); err != nil {
+	id := req.GetId()
+	name := s.m.queueJobName(ctx, id)
+	if err := s.m.api.Resume(ctx, id); err != nil {
 		return nil, err
 	}
-	if id := req.GetId(); id != "" {
-		s.m.watchJob(id, "")
+	if id != "" {
+		s.m.watchJob(id, name)
 	}
 	return &usenetv1.ResumeResponse{Success: true}, nil
 }
@@ -405,7 +511,7 @@ func (s *usenetServer) Delete(ctx context.Context, req *usenetv1.DeleteRequest) 
 	if err := s.m.configured(); err != nil {
 		return nil, err
 	}
-	if err := s.m.client.Delete(ctx, req.GetId(), req.GetDeleteFiles()); err != nil {
+	if err := s.m.api.Delete(ctx, req.GetId(), req.GetDeleteFiles()); err != nil {
 		return nil, err
 	}
 	return &usenetv1.DeleteResponse{Success: true}, nil
@@ -415,7 +521,7 @@ func (s *usenetServer) GetHistory(ctx context.Context, req *usenetv1.GetHistoryR
 	if err := s.m.configured(); err != nil {
 		return &usenetv1.GetHistoryResponse{}, nil
 	}
-	items, err := s.m.client.History(ctx, int(req.GetLimit()))
+	items, err := s.m.api.History(ctx, int(req.GetLimit()))
 	if err != nil {
 		return nil, err
 	}
