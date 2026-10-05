@@ -18,11 +18,10 @@ import (
 	"github.com/Muxcore-Media/core/pkg/contracts"
 	"github.com/Muxcore-Media/core/sdk/go/client"
 	modulesdk "github.com/Muxcore-Media/core/sdk/go/module"
+	manifest "github.com/Muxcore-Media/downloader-sabnzbd"
 	"github.com/Muxcore-Media/downloader-sabnzbd/internal/sabnzbd"
 	usenetv1 "github.com/Muxcore-Media/downloader-sabnzbd/proto/gen/muxcore/usenet/v1"
 )
-
-const moduleVersion = "0.1.1"
 
 // EventPublisher emits download.* domain events (test sink or mesh adapter).
 type EventPublisher func(ctx context.Context, eventType string, payload []byte) error
@@ -143,7 +142,7 @@ func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
 		ID:           m.id,
 		Name:         "SABnzbd / Usenet Downloader",
-		Version:      moduleVersion,
+		Version:      modulesdk.ManifestVersion(manifest.ManifestJSON),
 		Roles:        []string{"downloader", "usenet"},
 		Description:  "SABnzbd HTTP API bridge for NZB/usenet downloads",
 		Capabilities: []string{"downloader", "downloader.usenet", "usenet", "settings"},
