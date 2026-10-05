@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const apiKeyHeader = "X-SABnzbd-Apikey" //nolint:gosec // G101 false positive: HTTP header name, not a credential
@@ -27,24 +26,7 @@ func (c *Client) http() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	return &http.Client{Timeout: 30 * time.Second}
-}
-
-func validateNZBURL(nzbURL string) error {
-	if strings.TrimSpace(nzbURL) == "" {
-		return fmt.Errorf("nzb_url required")
-	}
-	u, err := url.Parse(nzbURL)
-	if err != nil {
-		return fmt.Errorf("nzb_url must be http(s): %w", err)
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("nzb_url must be http(s)")
-	}
-	if u.Host == "" {
-		return fmt.Errorf("nzb_url must be http(s)")
-	}
-	return nil
+	return newGuardedHTTPClient()
 }
 
 func parseJobID(out map[string]any, mode string) (string, error) {
@@ -69,6 +51,9 @@ func (c *Client) callWithBody(ctx context.Context, method, mode string, extra ur
 	}
 	if c.APIKey == "" {
 		return nil, fmt.Errorf("sabnzbd API key required")
+	}
+	if err := ValidateBaseURL(c.BaseURL); err != nil {
+		return nil, fmt.Errorf("sabnzbd base URL rejected: %w", err)
 	}
 	u, err := url.Parse(strings.TrimRight(c.BaseURL, "/") + "/api")
 	if err != nil {
@@ -116,7 +101,7 @@ func (c *Client) callWithBody(ctx context.Context, method, mode string, extra ur
 
 // AddURL queues an NZB by URL.
 func (c *Client) AddURL(ctx context.Context, nzbURL, name, category string, paused bool) (jobID string, err error) {
-	if urlErr := validateNZBURL(nzbURL); urlErr != nil {
+	if urlErr := checkNZBURL(ctx, nzbURL); urlErr != nil {
 		return "", urlErr
 	}
 	extra := url.Values{}

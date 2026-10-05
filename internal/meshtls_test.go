@@ -26,12 +26,6 @@ import (
 	"github.com/Muxcore-Media/downloader-sabnzbd/internal"
 )
 
-func TestMain(m *testing.M) {
-	// Existing tests use plaintext listeners; the mesh TLS test below re-enables TLS.
-	_ = os.Setenv("MUXCORE_INSECURE_DISABLE_TLS", "true")
-	os.Exit(m.Run())
-}
-
 func writeMeshPKI(t *testing.T) (certFile, keyFile, caFile string) {
 	t.Helper()
 	dir := t.TempDir()

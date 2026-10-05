@@ -39,6 +39,11 @@ func (m *Module) UpdateSetting(key, value string) error {
 	defer m.cfgMu.Unlock()
 	switch key {
 	case "base_url":
+		if value != "" {
+			if err := sabnzbd.ValidateBaseURL(value); err != nil {
+				return fmt.Errorf("base_url rejected: %w", err)
+			}
+		}
 		m.base = value
 	case "api_key":
 		if value != "" && value != "********" {

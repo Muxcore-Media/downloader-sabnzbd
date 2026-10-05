@@ -70,7 +70,7 @@ func (f *FixtureClient) completeLocked(j *mockJob) {
 }
 
 func (f *FixtureClient) AddURL(_ context.Context, nzbURL, name, category string, paused bool) (string, error) {
-	if err := validateNZBURL(nzbURL); err != nil {
+	if err := validateNZBURLSyntax(nzbURL); err != nil {
 		return "", err
 	}
 	if name == "" {
