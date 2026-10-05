@@ -1,7 +1,7 @@
 {
   "id": "downloader-sabnzbd",
   "name": "SABnzbd / Usenet Downloader",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "SABnzbd HTTP API bridge for NZB/usenet downloads",
   "roles": [
     "downloader",
