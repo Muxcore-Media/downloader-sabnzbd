@@ -14,13 +14,12 @@ import (
 // MockServer is an in-process SABnzbd /api stand-in for offline tests.
 // No network credentials required.
 type MockServer struct {
-	APIKey string
-	Server *httptest.Server
-
-	mu      sync.Mutex
-	seq     atomic.Uint64
+	Server  *httptest.Server
 	queue   map[string]*mockJob
 	history map[string]*mockJob
+	APIKey  string
+	seq     atomic.Uint64
+	mu      sync.Mutex
 }
 
 type mockJob struct {
@@ -29,10 +28,10 @@ type mockJob struct {
 	Category string
 	Status   string
 	Storage  string
+	Files    []HistoryFile
 	Pct      float64
 	SizeMB   float64
 	LeftMB   float64
-	Files    []HistoryFile
 }
 
 // NewMockServer starts an httptest SABnzbd API that accepts the given API key.

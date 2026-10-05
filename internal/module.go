@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -27,38 +28,34 @@ const moduleVersion = "0.1.1"
 type EventPublisher func(ctx context.Context, eventType string, payload []byte) error
 
 type Module struct {
-	id       string
-	grpcAddr string
-	httpAddr string
-
-	cfgMu   sync.RWMutex
-	base    string
-	apiKey  string
-	fixture bool
-
-	api     sabnzbd.API
-	grpcSrv *grpc.Server
-	lis     net.Listener
-	httpSrv *http.Server
-
-	pubMu     sync.RWMutex
+	api       sabnzbd.API
+	lis       net.Listener
 	publish   EventPublisher
-	pollEvery time.Duration
+	grpcSrv   *grpc.Server
+	mc        *client.Client
+	httpSrv   *http.Server
 	watched   sync.Map // jobID -> jobName
-
-	mc *client.Client
+	id        string
+	httpAddr  string
+	grpcAddr  string
+	apiKey    string
+	base      string
+	pollEvery time.Duration
+	pubMu     sync.RWMutex
+	cfgMu     sync.RWMutex
+	fixture   bool
 }
 
 type Config struct {
+	Publish    EventPublisher
+	HTTPClient *http.Client // optional; for tests inject httptest transport
 	ID         string
 	BaseURL    string
 	APIKey     string
 	GRPCAddr   string
 	HTTPAddr   string
-	Fixture    bool
-	Publish    EventPublisher
 	PollEvery  time.Duration
-	HTTPClient *http.Client // optional; for tests inject httptest transport
+	Fixture    bool
 }
 
 func fixtureEnabled(explicit bool) bool {
@@ -156,8 +153,8 @@ func (m *Module) Info() contracts.ModuleInfo {
 
 func (m *Module) Init(ctx context.Context) error { return nil }
 
-func (m *Module) serveHealth(w http.ResponseWriter, _ *http.Request) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func (m *Module) serveHealth(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	if err := m.Health(ctx); err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -169,7 +166,8 @@ func (m *Module) serveHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (m *Module) Start(ctx context.Context) error {
-	lis, err := net.Listen("tcp", m.grpcAddr)
+	var lc net.ListenConfig
+	lis, err := lc.Listen(ctx, "tcp", m.grpcAddr)
 	if err != nil {
 		return fmt.Errorf("listen gRPC %s: %w", m.grpcAddr, err)
 	}
@@ -180,27 +178,27 @@ func (m *Module) Start(ctx context.Context) error {
 
 	go func() {
 		slog.Info("usenet gRPC listening", "addr", m.grpcAddr, "fixture", m.fixture)
-		if err := m.grpcSrv.Serve(lis); err != nil {
-			slog.Error("gRPC serve", "error", err)
+		if serveErr := m.grpcSrv.Serve(lis); serveErr != nil {
+			slog.Error("gRPC serve", "error", serveErr)
 		}
 	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", m.serveHealth)
 	mux.HandleFunc("/healthz", m.serveHealth)
-	m.httpSrv = &http.Server{Handler: mux}
-	httpLis, err := net.Listen("tcp", m.httpAddr)
+	m.httpSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	httpLis, err := lc.Listen(ctx, "tcp", m.httpAddr)
 	if err != nil {
 		return fmt.Errorf("listen health %s: %w", m.httpAddr, err)
 	}
 	m.httpAddr = httpLis.Addr().String()
 	go func() {
 		slog.Info("health listening", "addr", m.httpAddr)
-		if err := m.httpSrv.Serve(httpLis); err != nil && err != http.ErrServerClosed {
+		if err := m.httpSrv.Serve(httpLis); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("health serve", "error", err)
 		}
 	}()
-	go m.dialCore(context.Background())
+	go m.dialCore(context.WithoutCancel(ctx))
 	return nil
 }
 
@@ -295,8 +293,8 @@ func (m *Module) queueJobName(ctx context.Context, id string) string {
 // waits until history reports Completed/Failed. Used by offline automation
 // paths and unit tests — never hits a live usenet provider by itself.
 func (m *Module) OfflineDispatch(ctx context.Context, nzbURL, name, category string) (jobID string, err error) {
-	if err := m.configured(); err != nil {
-		return "", err
+	if cfgErr := m.configured(); cfgErr != nil {
+		return "", cfgErr
 	}
 	id, err := m.api.AddURL(ctx, nzbURL, name, category, false)
 	if err != nil {
@@ -305,42 +303,44 @@ func (m *Module) OfflineDispatch(ctx context.Context, nzbURL, name, category str
 	if name == "" {
 		name = nzbURL
 	}
-	m.publishDownload(contracts.EventDownloadStarted, id, name, "", "", nil)
-	m.watchJob(id, name)
+	m.publishDownload(ctx, contracts.EventDownloadStarted, id, name, "", "", nil)
+	m.watchJob(ctx, id, name)
 	return id, m.waitHistory(ctx, id)
 }
 
-func (m *Module) watchJob(id, name string) {
+// watchJob polls history for id until it completes, fails, or 72h elapse. The
+// watcher outlives the calling request, so it detaches from ctx cancellation
+// while keeping its values.
+func (m *Module) watchJob(ctx context.Context, id, name string) {
 	if id == "" {
 		return
 	}
 	if _, loaded := m.watched.LoadOrStore(id, name); loaded {
 		return
 	}
+	detached := context.WithoutCancel(ctx)
 	go func() {
 		ticker := time.NewTicker(m.pollEvery)
 		defer ticker.Stop()
 		defer m.watched.Delete(id)
 		deadline := time.Now().Add(72 * time.Hour)
 		for time.Now().Before(deadline) {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			h, err := m.api.HistoryJob(ctx, id)
+			pollCtx, cancel := context.WithTimeout(detached, 5*time.Second)
+			h, err := m.api.HistoryJob(pollCtx, id)
 			cancel()
 			if err == nil && h != nil {
 				st := strings.ToLower(h.Status)
 				switch {
 				case strings.Contains(st, "complete"):
-					files := m.historyFiles(context.Background(), id)
-					m.publishDownload(contracts.EventDownloadCompleted, h.ID, h.Name, h.Storage, "", files)
+					files := m.historyFiles(detached, id)
+					m.publishDownload(detached, contracts.EventDownloadCompleted, h.ID, h.Name, h.Storage, "", files)
 					return
 				case strings.Contains(st, "fail"):
-					m.publishDownload(contracts.EventDownloadFailed, h.ID, h.Name, h.Storage, h.Status, nil)
+					m.publishDownload(detached, contracts.EventDownloadFailed, h.ID, h.Name, h.Storage, h.Status, nil)
 					return
 				}
 			}
-			select {
-			case <-ticker.C:
-			}
+			<-ticker.C
 		}
 		jobName := name
 		if jobName == "" {
@@ -348,7 +348,7 @@ func (m *Module) watchJob(id, name string) {
 				jobName, _ = v.(string)
 			}
 		}
-		m.publishDownload(contracts.EventDownloadFailed, id, jobName, "", "watch deadline exceeded (72h)", nil)
+		m.publishDownload(detached, contracts.EventDownloadFailed, id, jobName, "", "watch deadline exceeded (72h)", nil)
 	}()
 }
 
@@ -389,7 +389,7 @@ func (m *Module) historyFiles(ctx context.Context, id string) []contracts.Downlo
 	return out
 }
 
-func (m *Module) publishDownload(eventType, id, name, savePath, errStr string, files []contracts.DownloadEventFile) {
+func (m *Module) publishDownload(ctx context.Context, eventType, id, name, savePath, errStr string, files []contracts.DownloadEventFile) {
 	m.pubMu.RLock()
 	pub := m.publish
 	m.pubMu.RUnlock()
@@ -406,7 +406,8 @@ func (m *Module) publishDownload(eventType, id, name, savePath, errStr string, f
 	if err != nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Publish even if the caller's ctx is already cancelled (e.g. failure events).
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := pub(ctx, eventType, payload); err != nil {
 		slog.Warn("sabnzbd: publish event failed", "type", eventType, "error", err)
@@ -449,16 +450,16 @@ func (s *usenetServer) AddNZB(ctx context.Context, req *usenetv1.AddNZBRequest) 
 	if err != nil {
 		return nil, err
 	}
-	s.m.publishDownload(contracts.EventDownloadStarted, id, name, "", "", nil)
+	s.m.publishDownload(ctx, contracts.EventDownloadStarted, id, name, "", "", nil)
 	if !req.GetPaused() {
-		s.m.watchJob(id, name)
+		s.m.watchJob(ctx, id, name)
 	}
 	return &usenetv1.AddNZBResponse{JobId: id, Name: name}, nil
 }
 
 func (s *usenetServer) ListQueue(ctx context.Context, req *usenetv1.ListQueueRequest) (*usenetv1.ListQueueResponse, error) {
 	if err := s.m.configured(); err != nil {
-		return &usenetv1.ListQueueResponse{}, nil
+		return &usenetv1.ListQueueResponse{}, nil //nolint:nilerr // unconfigured backend reports an empty queue, not an RPC error
 	}
 	items, err := s.m.api.Queue(ctx)
 	if err != nil {
@@ -502,7 +503,7 @@ func (s *usenetServer) Resume(ctx context.Context, req *usenetv1.ResumeRequest) 
 		return nil, err
 	}
 	if id != "" {
-		s.m.watchJob(id, name)
+		s.m.watchJob(ctx, id, name)
 	}
 	return &usenetv1.ResumeResponse{Success: true}, nil
 }
@@ -519,7 +520,7 @@ func (s *usenetServer) Delete(ctx context.Context, req *usenetv1.DeleteRequest) 
 
 func (s *usenetServer) GetHistory(ctx context.Context, req *usenetv1.GetHistoryRequest) (*usenetv1.GetHistoryResponse, error) {
 	if err := s.m.configured(); err != nil {
-		return &usenetv1.GetHistoryResponse{}, nil
+		return &usenetv1.GetHistoryResponse{}, nil //nolint:nilerr // unconfigured backend reports empty history, not an RPC error
 	}
 	items, err := s.m.api.History(ctx, int(req.GetLimit()))
 	if err != nil {

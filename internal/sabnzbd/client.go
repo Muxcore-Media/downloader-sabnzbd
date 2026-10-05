@@ -14,13 +14,13 @@ import (
 	"time"
 )
 
-const apiKeyHeader = "X-SABnzbd-Apikey"
+const apiKeyHeader = "X-SABnzbd-Apikey" //nolint:gosec // G101 false positive: HTTP header name, not a credential
 
 // Client talks to SABnzbd's /api endpoint.
 type Client struct {
+	HTTPClient *http.Client
 	BaseURL    string
 	APIKey     string
-	HTTPClient *http.Client
 }
 
 func (c *Client) http() *http.Client {
@@ -116,8 +116,8 @@ func (c *Client) callWithBody(ctx context.Context, method, mode string, extra ur
 
 // AddURL queues an NZB by URL.
 func (c *Client) AddURL(ctx context.Context, nzbURL, name, category string, paused bool) (jobID string, err error) {
-	if err := validateNZBURL(nzbURL); err != nil {
-		return "", err
+	if urlErr := validateNZBURL(nzbURL); urlErr != nil {
+		return "", urlErr
 	}
 	extra := url.Values{}
 	extra.Set("name", nzbURL)

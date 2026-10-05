@@ -10,10 +10,10 @@ import (
 // FixtureClient is an in-memory SABnzbd stand-in for CI / DOWNLOADER_ENGINE=fixture.
 // No HTTP and no live SABnzbd required.
 type FixtureClient struct {
-	mu      sync.Mutex
-	seq     atomic.Uint64
 	queue   map[string]*mockJob
 	history map[string]*mockJob
+	seq     atomic.Uint64
+	mu      sync.Mutex
 }
 
 // NewFixtureClient returns an empty fixture store.
